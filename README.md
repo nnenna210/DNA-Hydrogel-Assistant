@@ -25,16 +25,22 @@ Exit
 
 
 This mode allows you to explore all features without having to change the parameters of the file or utilize a terminal.
+
 Default Recipe Suggestion
+
 If you select option 2 at startup, the program will print a default hydrogel recipe using standard settings, along with predicted stiffness, mesh size, diffusion coefficient, and photopatterning resolution. A JSON copy of the recipe is then saved in: outputs/recipe_suggestion.json
 
 
 Graphical Interface
+
 To launch the GUI directly, press 3
+
 A window will open that will allow you to input stiffness, crosslink level, and patterning priority. The GUI displays a formatted recipe with predicted properties.
 
 Dependencies Needed
+
 Python 3
+
 Numpy
 Pandas
 Matplotlib
