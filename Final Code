@@ -1,0 +1,1260 @@
+#!/usr/bin/env python3
+"""
+DNA Hydrogel Design Assistant
+-----------------------------
+
+This is a Python project I made to help suggest DNA-crosslinked hydrogel recipes.
+
+The idea is:
+- You tell it roughly what stiffness you want (in kPa),
+- how much you care about patterning resolution vs biocompatibility,
+- and how "crosslinked" you want the DNA part to be.
+
+Then the code uses some made-up, approximate tables and simple interpolation to guess:
+- PEGDA wt%
+- PEGDA molecular weight
+- DNA linker concentration
+- photoinitiator (PI) percentage
+- some predicted properties (stiffness, mesh size, diffusion, feature size)
+
+This also includes:
+- some matplotlib plots to see trends,
+- a small Tkinter GUI,
+- a text-based menu if you don’t feel like using command line arguments,
+- and a few self-tests just to check that nothing is obviously broken.
+
+Note: a lot of the numbers are not from real experiments; they are just
+reasonable-looking guesses so I could build the logic.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import textwrap
+from dataclasses import dataclass, asdict, field
+from pathlib import Path
+from typing import Dict, Any, Optional, List, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+except ImportError:
+    tk = None
+    ttk = None
+    messagebox = None
+
+
+
+# Basic data containers for configuration, requests, recipes, and tables
+
+
+@dataclass
+class GlobalConfig:
+    """
+    Holds basic settings that I want to use everywhere.
+
+    """
+    name: str = "default_global_config"
+    default_buffer: str = "1x PBS"
+    default_temperature_c: float = 25.0
+    default_pi_type: str = "LAP"
+    default_units_concentration: str = "wt%"
+    biocompatibility_bias: float = 0.5
+    patterning_bias: float = 0.5
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Turn this config into a normal dict so it’s easy to save as JSON."""
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> "GlobalConfig":
+        """Create a GlobalConfig from a dict (for loading from JSON)."""
+        return GlobalConfig(**data)
+
+
+@dataclass
+class RecipeRequest:
+    """
+    What the user is asking the hydrogel to be like.
+
+    Attributes:
+        target_stiffness_kpa:
+            The stiffness you want in kPa (like 1–30). If you leave it as None,
+            the code just uses a default value.
+
+        pattern_priority:
+            How much you care about resolution vs biocompatibility.
+            One of {"high_res", "balanced", "biocompatible"}.
+
+        crosslink_level:
+            How strong you want the DNA crosslinking:
+            {"low", "medium", "high"}.
+
+        pegda_mw_preference:
+            If you already know you want low/medium/high MW PEGDA, you can
+            say that here. Otherwise it gets chosen automatically.
+
+        max_pi_percent:
+            If you want to cap the maximum PI percentage, set it here.
+    """
+    target_stiffness_kpa: Optional[float] = None
+    pattern_priority: str = "balanced"
+    crosslink_level: str = "medium"
+    pegda_mw_preference: Optional[str] = None
+    max_pi_percent: Optional[float] = None
+
+
+@dataclass
+class HydrogelRecipe:
+    """
+    a single suggested hydrogel “recipe” based on the request.
+    """
+    name: str
+    pegda_wt_percent: float
+    pegda_mw: int
+    dna_linker_uM: float
+    dna_ratio: float  # fraction of acrylate groups contributed by DNA
+    pi_percent: float
+    buffer: str
+    notes: str = ""
+    target_stiffness_kpa: Optional[float] = None
+    predicted_stiffness_kpa: Optional[float] = None
+    predicted_mesh_nm: Optional[float] = None
+    predicted_diffusion_um2_s: Optional[float] = None
+    predicted_resolution_um: Optional[float] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Turn the recipe into a dict (for printing or saving to JSON)."""
+        return asdict(self)
+
+
+@dataclass
+class EmpiricalTables:
+    """
+    stores the pandas DataFrames I use for my fake “empirical” data.
+
+    these are not real experimental tables; they’re just set up so I can
+    interpolate things like stiffness, mesh size, etc.
+    """
+    stiffness_table: pd.DataFrame
+    mesh_table: pd.DataFrame
+    dna_factor_table: pd.DataFrame
+    diffusion_table: pd.DataFrame
+    resolution_table: pd.DataFrame
+
+
+# Making up the “empirical” data tables
+
+
+def build_empirical_tables() -> EmpiricalTables:
+    """
+    builds the rough data tables that the rest of the code looks up values from.
+
+    hese are all approximate and mostly reasonable guesses, not real data.
+    Assumptions:
+      - Higher PEGDA wt% leads to a stiffer gel
+      - Lower PEGDA MW means stiffer or tighter mesh
+      - More DNA crosslinks means a bit more stiffness
+      - Higher PI% means better pattern resolution but worse biocompatibility
+    """
+    # stiffness vs PEGDA wt% for different PEGDA MW values.
+    stiffness_data = {
+        "pegda_mw": [],
+        "pegda_wt": [],
+        "G_kpa": [],
+    }
+
+    # Some PEGDA molecular weights and wt% points that I decided to use.
+    pegda_mw_values = [700, 2000, 3400, 10000]
+    wt_points = [5, 10, 15, 20, 25]
+
+    # “Base” stiffness at 10 wt% for each MW (in kPa).
+    base_stiffness_at10 = {
+        700: 5.0,
+        2000: 3.0,
+        3400: 2.0,
+        10000: 1.0,
+    }
+
+    for mw in pegda_mw_values:
+        base = base_stiffness_at10[mw]
+        for wt in wt_points:
+            # I just used a simple quadratic scaling:
+            # stiffness ~ base * (wt / 10)^2
+            G = base * (wt / 10.0) ** 2
+            stiffness_data["pegda_mw"].append(mw)
+            stiffness_data["pegda_wt"].append(wt)
+            stiffness_data["G_kpa"].append(G)
+
+    stiffness_table = pd.DataFrame(stiffness_data)
+
+    # mesh size vs PEGDA MW at a reference 10 wt%.
+    mesh_data = {
+        "pegda_mw": [700, 2000, 3400, 10000],
+        # Totally made-up but somewhat reasonable increasing trend.
+        "mesh_nm_at10wt": [10.0, 20.0, 30.0, 60.0],
+    }
+    mesh_table = pd.DataFrame(mesh_data)
+
+    # DNA crosslink factor table: this is how much DNA increases stiffness.
+    dna_factor_data = {
+        "dna_ratio": [0.0, 0.05, 0.1, 0.15, 0.2],
+        "stiffness_factor": [1.0, 1.1, 1.2, 1.35, 1.5],
+    }
+    dna_factor_table = pd.DataFrame(dna_factor_data)
+
+    # diffusion vs PEGDA wt% (for a small molecule / oligo).
+    diffusion_data = {
+        "pegda_wt": [5, 10, 15, 20, 25],
+        "D_um2_s": [60.0, 40.0, 28.0, 20.0, 15.0],
+    }
+    diffusion_table = pd.DataFrame(diffusion_data)
+
+    # pattern feature size vs PI%. I only used PI% here to keep it simple.
+    resolution_data = {
+        "pi_percent": [0.05, 0.1, 0.2, 0.3],
+        "feature_size_um": [40, 30, 20, 15],
+    }
+    resolution_table = pd.DataFrame(resolution_data)
+
+    return EmpiricalTables(
+        stiffness_table=stiffness_table,
+        mesh_table=mesh_table,
+        dna_factor_table=dna_factor_table,
+        diffusion_table=diffusion_table,
+        resolution_table=resolution_table,
+    )
+
+
+
+# Database-style helper for predicting properties
+
+class HydrogelDatabase:
+    """
+    This class wraps the tables and does the actual interpolation.
+
+    It can:
+      - predict stiffness,
+      - predict mesh size,
+      - predict diffusion,
+      - predict feature size (resolution).
+
+    Everything is pretty simple and uses numpy interpolation.
+    """
+
+    def __init__(self, tables: Optional[EmpiricalTables] = None) -> None:
+        if tables is None:
+            tables = build_empirical_tables()
+        self.tables = tables
+
+    # ----- Stiffness stuff -----
+
+    def predict_base_stiffness(
+        self, pegda_mw: int, pegda_wt: float
+    ) -> float:
+        """
+        predict the stiffness (kPa) for a given PEGDA MW and wt%,
+        ignoring DNA crosslinks.
+
+        I just filter the table by MW, clamp the wt%, and use linear interpolation.
+        """
+        df = self.tables.stiffness_table
+        sub = df[df["pegda_mw"] == pegda_mw].sort_values("pegda_wt")
+
+        if sub.empty:
+            # If this MW isn't in the table, pick the closest one that is.
+            available_mw = sorted(df["pegda_mw"].unique())
+            nearest_mw = min(available_mw, key=lambda m: abs(m - pegda_mw))
+            sub = df[df["pegda_mw"] == nearest_mw].sort_values("pegda_wt")
+
+        # Clamp wt% to the range in the table.
+        min_wt = sub["pegda_wt"].min()
+        max_wt = sub["pegda_wt"].max()
+        wt_clamped = max(min(pegda_wt, max_wt), min_wt)
+
+        # Do linear interpolation on PEGDA wt% vs G_kpa.
+        return float(
+            np.interp(
+                wt_clamped,
+                sub["pegda_wt"].values,
+                sub["G_kpa"].values,
+            )
+        )
+
+    def dna_stiffness_factor(self, dna_ratio: float) -> float:
+        """
+        Look up how much the DNA crosslink ratio multiplies the stiffness.
+
+        Again, this is just a simple interpolation in the dna_factor_table.
+        """
+        df = self.tables.dna_factor_table.sort_values("dna_ratio")
+        min_r = df["dna_ratio"].min()
+        max_r = df["dna_ratio"].max()
+        r_clamped = max(min(dna_ratio, max_r), min_r)
+        return float(
+            np.interp(
+                r_clamped,
+                df["dna_ratio"].values,
+                df["stiffness_factor"].values,
+            )
+        )
+
+    def predict_stiffness(
+        self,
+        pegda_mw: int,
+        pegda_wt: float,
+        dna_ratio: float,
+    ) -> float:
+        """
+        predict the total stiffness (kPa), including the effect of DNA crosslinks.
+
+        basically:
+          base_stiffness(pegda_mw, wt%) * dna_factor(dna_ratio)
+        """
+        base = self.predict_base_stiffness(pegda_mw, pegda_wt)
+        factor = self.dna_stiffness_factor(dna_ratio)
+        return base * factor
+
+    # ----- Mesh size stuff -----
+
+    def predict_mesh_size_nm(
+        self,
+        pegda_mw: int,
+        pegda_wt: float,
+    ) -> float:
+        """
+        roughly predict the mesh size in nm.
+
+        I interpolate the mesh size at 10 wt% by MW, then scale it by wt%
+        with a square-root relationship:
+
+            mesh ~ mesh_at10 * (10 / wt%)^(1/2)
+
+        This is pretty approximate but gets the trend right.
+        """
+        df = self.tables.mesh_table.sort_values("pegda_mw")
+        min_mw = df["pegda_mw"].min()
+        max_mw = df["pegda_mw"].max()
+        mw_clamped = max(min(pegda_mw, max_mw), min_mw)
+
+        mesh_at10 = float(
+            np.interp(
+                mw_clamped,
+                df["pegda_mw"].values,
+                df["mesh_nm_at10wt"].values,
+            )
+        )
+        wt_ref = 10.0
+        wt_ratio = wt_ref / max(pegda_wt, 1e-3)
+        mesh = mesh_at10 * math.sqrt(wt_ratio)
+        return mesh
+
+    # ----- Diffusion stuff -----
+
+    def predict_diffusion_um2_s(
+        self,
+        pegda_wt: float,
+    ) -> float:
+        """
+        predict diffusion coefficient (µm^2/s) for a small molecule.
+
+        this just depends on PEGDA wt% in my simple model.
+        """
+        df = self.tables.diffusion_table.sort_values("pegda_wt")
+        min_wt = df["pegda_wt"].min()
+        max_wt = df["pegda_wt"].max()
+        wt_clamped = max(min(pegda_wt, max_wt), min_wt)
+        return float(
+            np.interp(
+                wt_clamped,
+                df["pegda_wt"].values,
+                df["D_um2_s"].values,
+            )
+        )
+
+    # ----- Resolution stuff -----
+
+    def predict_feature_size_um(self, pi_percent: float) -> float:
+        """
+        Predict the smallest feature size (µm) from the PI percentage.
+
+        Higher PI% usually gives better resolution , thus smaller feature size.
+        then just interpolate in the resolution table.
+        """
+        df = self.tables.resolution_table.sort_values("pi_percent")
+        min_pi = df["pi_percent"].min()
+        max_pi = df["pi_percent"].max()
+        pi_clamped = max(min(pi_percent, max_pi), min_pi)
+        return float(
+            np.interp(
+                pi_clamped,
+                df["pi_percent"].values,
+                df["feature_size_um"].values,
+            )
+        )
+
+
+
+# Recipe suggestion engine (uses the database + settings)
+
+class RecipeEngine:
+    """
+    This class ties everything together:
+      - it uses HydrogelDatabase,
+      - it reads GlobalConfig,
+      - it looks at the RecipeRequest,
+      - and it outputs a HydrogelRecipe.
+
+    All the “decision logic” for choosing MW, DNA ratio, PI%, etc. lives here.
+    """
+
+    def __init__(
+        self,
+        db: Optional[HydrogelDatabase] = None,
+        config: Optional[GlobalConfig] = None,
+    ) -> None:
+        self.db = db or HydrogelDatabase()
+        self.config = config or GlobalConfig()
+
+    def _choose_pegda_mw(self, request: RecipeRequest) -> int:
+        """
+        Decide which PEGDA MW to use based on pattern priority and preferences.
+
+        Very rough rule:
+          - lower MW , stiffer and more “tight”
+          - higher MW , softer and usually nicer for cells
+        """
+        if request.pegda_mw_preference:
+            pref = request.pegda_mw_preference.lower()
+            if pref == "low":
+                return 700
+            if pref == "medium":
+                return 3400
+            if pref == "high":
+                return 10000
+
+        if request.pattern_priority == "high_res":
+            return 700
+        if request.pattern_priority == "biocompatible":
+            return 3400
+        return 2000  # in the middle
+
+    def _choose_dna_ratio(self, request: RecipeRequest) -> float:
+        """
+        Pick a DNA crosslink ratio based on how strong you want the crosslinking.
+        """
+        level = request.crosslink_level.lower()
+        if level == "low":
+            return 0.05
+        if level == "medium":
+            return 0.1
+        if level == "high":
+            return 0.15
+        return 0.1
+
+    def _choose_pi_percent(self, request: RecipeRequest) -> float:
+        """
+        Pick the photoinitiator (PI) percentage based on pattern priority.
+
+        High resolution means more PI,
+        biocompatible means less PI,
+        balanced  means somewhere in between.
+
+        then I slightly adjust this using the global patterning/biocompatibility
+        biases, and clamp it into [0.05, 0.3] wt%.
+        """
+        priority = request.pattern_priority.lower()
+        if priority == "high_res":
+            base_pi = 0.2
+        elif priority == "biocompatible":
+            base_pi = 0.1
+        else:
+            base_pi = 0.15
+
+        if request.max_pi_percent is not None:
+            base_pi = min(base_pi, request.max_pi_percent)
+
+        # Simple biasing: pattern_bias pushes PI up, biocomp_bias pushes it down.
+        biocomp_bias = self.config.biocompatibility_bias
+        pattern_bias = self.config.patterning_bias
+
+        min_pi = 0.05
+        max_pi = 0.3
+        normalized = (base_pi - min_pi) / (max_pi - min_pi + 1e-9)
+
+        normalized += 0.1 * pattern_bias
+        normalized -= 0.1 * biocomp_bias
+        normalized = max(0.0, min(1.0, normalized))
+
+        return min_pi + normalized * (max_pi - min_pi)
+
+    def _estimate_pegda_wt_for_stiffness(
+        self,
+        pegda_mw: int,
+        dna_ratio: float,
+        target_stiffness_kpa: float,
+        wt_bounds: Tuple[float, float] = (5.0, 25.0),
+    ) -> float:
+        """
+        Try to find a PEGDA wt% that gives the stiffness we want.
+
+        Very general I just:
+          - generated a bunch of candidate wt% values,
+          - computed the predicted stiffness for each one,
+          - and pick the one with the smallest error to the target.
+        """
+        w_min, w_max = wt_bounds
+        wt_candidates = np.linspace(w_min, w_max, 100)
+        errors: List[float] = []
+        for wt in wt_candidates:
+            pred = self.db.predict_stiffness(pegda_mw, wt, dna_ratio)
+            errors.append(abs(pred - target_stiffness_kpa))
+
+        best_idx = int(np.argmin(np.array(errors)))
+        return float(wt_candidates[best_idx])
+
+    # ----- This is the main public method -----
+
+    def suggest_recipe(self, request: RecipeRequest) -> HydrogelRecipe:
+        """
+        Take a RecipeRequest and return a suggested HydrogelRecipe.
+
+        Steps:
+          1. Figure out a target stiffness (or use default if None).
+          2. Choose PEGDA MW, DNA ratio, and PI%.
+          3. Guess PEGDA wt% that hits the target stiffness.
+          4. Predict mesh size, diffusion, feature size.
+          5. Estimate a DNA linker concentration (very rough).
+        """
+        if request.target_stiffness_kpa is None:
+            # If the user doesn’t give a target, just pick 5 kPa which is standard
+            target_stiffness = 5.0
+        else:
+            target_stiffness = float(request.target_stiffness_kpa)
+
+        pegda_mw = self._choose_pegda_mw(request)
+        dna_ratio = self._choose_dna_ratio(request)
+        pi_percent = self._choose_pi_percent(request)
+
+        pegda_wt = self._estimate_pegda_wt_for_stiffness(
+            pegda_mw=pegda_mw,
+            dna_ratio=dna_ratio,
+            target_stiffness_kpa=target_stiffness,
+        )
+
+        predicted_stiffness = self.db.predict_stiffness(
+            pegda_mw=pegda_mw,
+            pegda_wt=pegda_wt,
+            dna_ratio=dna_ratio,
+        )
+        mesh_nm = self.db.predict_mesh_size_nm(
+            pegda_mw=pegda_mw,
+            pegda_wt=pegda_wt,
+        )
+        diff = self.db.predict_diffusion_um2_s(pegda_wt=pegda_wt)
+        feature_size = self.db.predict_feature_size_um(pi_percent=pi_percent)
+
+        # Rough guess for DNA linker concentration in µM:
+        # I just made it scale with PEGDA wt% and DNA ratio.
+        dna_linker_uM = 50.0 + 10.0 * (pegda_wt - 10.0) + 100.0 * dna_ratio
+        dna_linker_uM = max(10.0, dna_linker_uM)
+
+        buffer = self.config.default_buffer
+
+        notes_parts = [
+            f"PEGDA {pegda_mw} g/mol, {pegda_wt:.1f} wt%",
+            f"DNA ratio ~ {dna_ratio:.2f}",
+            f"PI {self.config.default_pi_type} at {pi_percent:.3f} wt%",
+        ]
+        if request.pattern_priority == "high_res":
+            notes_parts.append("Optimized for high pattern resolution.")
+        elif request.pattern_priority == "biocompatible":
+            notes_parts.append("Biocompatibility-biased formulation.")
+        else:
+            notes_parts.append("Balanced formulation.")
+
+        recipe = HydrogelRecipe(
+            name="DNA Hydrogel Recipe",
+            pegda_wt_percent=pegda_wt,
+            pegda_mw=pegda_mw,
+            dna_linker_uM=dna_linker_uM,
+            dna_ratio=dna_ratio,
+            pi_percent=pi_percent,
+            buffer=buffer,
+            notes=" ".join(notes_parts),
+            target_stiffness_kpa=target_stiffness,
+            predicted_stiffness_kpa=predicted_stiffness,
+            predicted_mesh_nm=mesh_nm,
+            predicted_diffusion_um2_s=diff,
+            predicted_resolution_um=feature_size,
+        )
+        return recipe
+
+
+
+# Plotting helper class (visualization)
+
+class Visualizer:
+    """
+    this class just groups some plotting functions together.
+
+    It uses the HydrogelDatabase to:
+      - plot stiffness vs PEGDA wt%,
+      - plot diffusion vs PEGDA wt%,
+      - plot stiffness vs DNA ratio.
+
+    all plots use matplotlib.
+    """
+
+    def __init__(self, db: HydrogelDatabase) -> None:
+        self.db = db
+
+    def plot_stiffness_curve(
+        self,
+        pegda_mw: int,
+        dna_ratio: float,
+        wt_bounds: Tuple[float, float] = (5.0, 25.0),
+        show: bool = True,
+        savepath: Optional[Path] = None,
+    ) -> None:
+        """Plot stiffness as a function of PEGDA wt% for a given MW and DNA ratio."""
+        wt_vals = np.linspace(wt_bounds[0], wt_bounds[1], 50)
+        G_vals = [
+            self.db.predict_stiffness(pegda_mw, wt, dna_ratio)
+            for wt in wt_vals
+        ]
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(wt_vals, G_vals, label=f"MW={pegda_mw}, DNA ratio={dna_ratio:.2f}")
+        ax.set_xlabel("PEGDA wt%")
+        ax.set_ylabel("Predicted stiffness G' (kPa)")
+        ax.set_title("Stiffness vs PEGDA wt%")
+        ax.grid(True)
+        ax.legend()
+        fig.tight_layout()
+        if savepath is not None:
+            fig.savefig(savepath, dpi=300)
+        if show:
+            plt.show()
+        plt.close(fig)
+
+    def plot_diffusion_vs_wt(
+        self,
+        wt_bounds: Tuple[float, float] = (5.0, 25.0),
+        show: bool = True,
+        savepath: Optional[Path] = None,
+    ) -> None:
+        """Plot how diffusion changes with PEGDA wt%."""
+        wt_vals = np.linspace(wt_bounds[0], wt_bounds[1], 50)
+        D_vals = [self.db.predict_diffusion_um2_s(wt) for wt in wt_vals]
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(wt_vals, D_vals, label="Small molecule diffusion")
+        ax.set_xlabel("PEGDA wt%")
+        ax.set_ylabel("D (µm²/s)")
+        ax.set_title("Diffusion vs PEGDA wt%")
+        ax.grid(True)
+        ax.legend()
+        fig.tight_layout()
+        if savepath is not None:
+            fig.savefig(savepath, dpi=300)
+        if show:
+            plt.show()
+        plt.close(fig)
+
+    def plot_dna_factor_curve(
+        self,
+        pegda_mw: int,
+        pegda_wt: float,
+        show: bool = True,
+        savepath: Optional[Path] = None,
+    ) -> None:
+        """Plot how stiffness changes as you increase the DNA crosslink ratio."""
+        dna_ratios = np.linspace(0.0, 0.2, 50)
+        G_vals = [
+            self.db.predict_stiffness(pegda_mw, pegda_wt, r)
+            for r in dna_ratios
+        ]
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(dna_ratios, G_vals, label=f"MW={pegda_mw}, {pegda_wt:.1f} wt%")
+        ax.set_xlabel("DNA crosslink ratio")
+        ax.set_ylabel("Predicted stiffness G' (kPa)")
+        ax.set_title("Effect of DNA crosslink ratio on stiffness")
+        ax.grid(True)
+        ax.legend()
+        fig.tight_layout()
+        if savepath is not None:
+            fig.savefig(savepath, dpi=300)
+        if show:
+            plt.show()
+        plt.close(fig)
+
+
+# Saving and loading global config (JSON)
+
+
+class ConfigManager:
+    """
+    Simple helper for saving/loading GlobalConfig as JSON files.
+    """
+
+    @staticmethod
+    def save_config(config: GlobalConfig, path: Path) -> None:
+        """Save a GlobalConfig to a JSON file at the given path."""
+        data = config.to_dict()
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        print(f"Saved global config to {path}")
+
+    @staticmethod
+    def load_config(path: Path) -> GlobalConfig:
+        """Load a GlobalConfig from a JSON file."""
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return GlobalConfig.from_dict(data)
+
+
+# Command-line argument setup
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """
+    Set up the command-line interface.
+
+    You can choose different modes like:
+      - suggest: get a recipe
+      - stiff:   plot stiffness vs PEGDA wt%
+      - diff:    plot diffusion vs PEGDA wt%
+      - dna:     plot stiffness vs DNA crosslink ratio
+      - gui:     open a small Tkinter GUI
+      - selftest: run a few quick checks
+      - menu:    use an interactive text menu
+    """
+    desc = textwrap.dedent(
+        """
+        DNA Hydrogel Design Assistant
+
+        Modes:
+          suggest   - generates a recommended DNA hydrogel recipe
+          stiff     - plots stiffness vs PEGDA wt% for a given MW & DNA ratio.
+          diff      - plots diffusion vs PEGDA wt%.
+          dna       - plots stiffness vs DNA crosslink ratio.
+          gui       - launches a simple Tkinter GUI
+          selftest  - runs basic self-tests.
+          menu      - runs an interactive text-based menu.
+
+        Examples:
+          python FinalProject1.py --mode suggest --target_stiffness 5
+          python FinalProject1.py --mode stiff --pegda_mw 3400 --dna_ratio 0.1
+        """
+    )
+    parser = argparse.ArgumentParser(
+        prog="dna_hydrogel_assistant",
+        description=desc,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default=None,  # None means we will ask the user which mode they want.
+        choices=["suggest", "stiff", "diff", "dna", "gui", "selftest", "menu"],
+        help="Which action to perform.",
+    )
+
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to global config JSON file.",
+    )
+
+    parser.add_argument(
+        "--write_config",
+        type=str,
+        default=None,
+        help="Write a template global config JSON to this path and exit.",
+    )
+
+    # Suggestion parameters
+    parser.add_argument(
+        "--target_stiffness",
+        type=float,
+        default=None,
+        help="Target stiffness in kPa for recipe suggestion.",
+    )
+    parser.add_argument(
+        "--pattern_priority",
+        type=str,
+        default="balanced",
+        choices=["high_res", "balanced", "biocompatible"],
+        help="Emphasis on pattern resolution vs biocompatibility.",
+    )
+    parser.add_argument(
+        "--crosslink_level",
+        type=str,
+        default="medium",
+        choices=["low", "medium", "high"],
+        help="DNA crosslink density level.",
+    )
+    parser.add_argument(
+        "--pegda_mw_pref",
+        type=str,
+        default=None,
+        choices=["low", "medium", "high"],
+        help="Optional PEGDA MW preference.",
+    )
+    parser.add_argument(
+        "--max_pi",
+        type=float,
+        default=None,
+        help="Optional maximum PI wt%% for suggested recipe.",
+    )
+
+    # Plotting parameters
+    parser.add_argument(
+        "--pegda_mw",
+        type=int,
+        default=3400,
+        help="PEGDA MW for stiffness/dna plots.",
+    )
+    parser.add_argument(
+        "--dna_ratio",
+        type=float,
+        default=0.1,
+        help="DNA ratio for stiffness plots.",
+    )
+    parser.add_argument(
+        "--pegda_wt",
+        type=float,
+        default=10.0,
+        help="PEGDA wt%% for DNA crosslink plots.",
+    )
+
+    parser.add_argument(
+        "--no_show",
+        action="store_true",
+        help="Do not display plots interactively.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="outputs",
+        help="Directory to save plots.",
+    )
+
+    return parser
+
+
+
+# Tkinter GUI wrapper
+
+class HydrogelGUI:
+    """
+    Small Tkinter GUI to let someone type in inputs and get a recipe.
+
+    I wrapped the RecipeEngine with a basic form so you don't need
+    to know anything about the command line to try it.
+    """
+
+    def __init__(
+        self,
+        root: tk.Tk,
+        engine: RecipeEngine,
+    ) -> None:
+        self.root = root
+        self.engine = engine
+        self.root.title("DNA Hydrogel Design Assistant")
+
+        mainframe = ttk.Frame(root, padding="12 12 12 12")
+        mainframe.grid(row=0, column=0, sticky="nsew")
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
+
+        # Inputs
+        ttk.Label(mainframe, text="Target stiffness (kPa):").grid(row=0, column=0, sticky="w")
+        self.stiffness_var = tk.StringVar(value="5.0")
+        ttk.Entry(mainframe, width=10, textvariable=self.stiffness_var).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(mainframe, text="Pattern priority:").grid(row=1, column=0, sticky="w")
+        self.pattern_var = tk.StringVar(value="balanced")
+        pattern_box = ttk.Combobox(
+            mainframe,
+            textvariable=self.pattern_var,
+            values=["high_res", "balanced", "biocompatible"],
+            state="readonly",
+        )
+        pattern_box.grid(row=1, column=1, sticky="w")
+
+        ttk.Label(mainframe, text="Crosslink level:").grid(row=2, column=0, sticky="w")
+        self.crosslink_var = tk.StringVar(value="medium")
+        crosslink_box = ttk.Combobox(
+            mainframe,
+            textvariable=self.crosslink_var,
+            values=["low", "medium", "high"],
+            state="readonly",
+        )
+        crosslink_box.grid(row=2, column=1, sticky="w")
+
+        ttk.Label(mainframe, text="PEGDA MW preference:").grid(row=3, column=0, sticky="w")
+        self.mw_pref_var = tk.StringVar(value="")
+        mw_pref_box = ttk.Combobox(
+            mainframe,
+            textvariable=self.mw_pref_var,
+            values=["", "low", "medium", "high"],
+            state="readonly",
+        )
+        mw_pref_box.grid(row=3, column=1, sticky="w")
+
+        ttk.Label(mainframe, text="Max PI wt% (optional):").grid(row=4, column=0, sticky="w")
+        self.max_pi_var = tk.StringVar(value="")
+        ttk.Entry(mainframe, width=10, textvariable=self.max_pi_var).grid(row=4, column=1, sticky="w")
+
+        # btton for running the suggestion
+        ttk.Button(
+            mainframe,
+            text="Suggest Recipe",
+            command=self._on_suggest,
+        ).grid(row=5, column=0, columnspan=2, pady=8)
+
+        # text box for showing the result
+        self.output_text = tk.Text(mainframe, width=60, height=15, wrap="word")
+        self.output_text.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
+        mainframe.rowconfigure(6, weight=1)
+        mainframe.columnconfigure(1, weight=1)
+
+    def _on_suggest(self) -> None:
+        """Handle the click on the 'Suggest Recipe' button."""
+        try:
+            target_stiffness = float(self.stiffness_var.get())
+        except ValueError:
+            messagebox.showerror("Input error", "Target stiffness must be a number.")
+            return
+
+        pattern_priority = self.pattern_var.get()
+        crosslink_level = self.crosslink_var.get()
+        mw_pref = self.mw_pref_var.get() or None
+
+        max_pi: Optional[float]
+        if self.max_pi_var.get().strip():
+            try:
+                max_pi = float(self.max_pi_var.get())
+            except ValueError:
+                messagebox.showerror("Input error", "Max PI must be a number.")
+                return
+        else:
+            max_pi = None
+
+        request = RecipeRequest(
+            target_stiffness_kpa=target_stiffness,
+            pattern_priority=pattern_priority,
+            crosslink_level=crosslink_level,
+            pegda_mw_preference=mw_pref,
+            max_pi_percent=max_pi,
+        )
+        recipe = self.engine.suggest_recipe(request)
+        self.show_recipe(recipe)
+
+    def show_recipe(self, recipe: HydrogelRecipe) -> None:
+        """Print the recipe details into the GUI text box."""
+        self.output_text.delete("1.0", tk.END)
+        lines = [
+            "DNA Hydrogel Recipe Suggestion",
+            "--------------------------------",
+            f"Target stiffness:      {recipe.target_stiffness_kpa:.2f} kPa",
+            f"Predicted stiffness:   {recipe.predicted_stiffness_kpa:.2f} kPa",
+            f"PEGDA MW:              {recipe.pegda_mw} g/mol",
+            f"PEGDA wt%:             {recipe.pegda_wt_percent:.2f}",
+            f"DNA ratio:             {recipe.dna_ratio:.2f}",
+            f"DNA linker conc.:      {recipe.dna_linker_uM:.1f} µM",
+            f"Photoinitiator:        {recipe.pi_percent:.3f} wt% {recipe.buffer}",
+            f"Buffer:                {recipe.buffer}",
+            "",
+            f"Predicted mesh size:   {recipe.predicted_mesh_nm:.1f} nm",
+            f"Predicted D:           {recipe.predicted_diffusion_um2_s:.1f} µm²/s",
+            f"Predicted resolution:  {recipe.predicted_resolution_um:.1f} µm",
+            "",
+            "Notes:",
+            recipe.notes,
+        ]
+        self.output_text.insert(tk.END, "\n".join(lines))
+
+
+# Very simple self-tests
+
+def run_selftests() -> None:
+    """
+    run a few quick checks to make sure the main logic isn't totally broken.
+
+    These are not full unit tests; they just verify that:
+      - the engine can suggest a recipe,
+      - high_res vs biocompatible affects PI%,
+      - increasing PEGDA wt% increases stiffness.
+    """
+    print("Running self-tests...\n")
+    db = HydrogelDatabase()
+    cfg = GlobalConfig()
+    engine = RecipeEngine(db=db, config=cfg)
+
+    # test 1: Default suggestion
+    req = RecipeRequest(
+        target_stiffness_kpa=5.0,
+        pattern_priority="balanced",
+        crosslink_level="medium",
+    )
+    recipe = engine.suggest_recipe(req)
+    assert recipe.predicted_stiffness_kpa is not None
+    print(f"Test 1: predicted stiffness ~ {recipe.predicted_stiffness_kpa:.2f} kPa")
+
+    # test 2: High-res vs biocompatible should change PI
+    req_high = RecipeRequest(
+        target_stiffness_kpa=5.0,
+        pattern_priority="high_res",
+        crosslink_level="medium",
+    )
+    req_bio = RecipeRequest(
+        target_stiffness_kpa=5.0,
+        pattern_priority="biocompatible",
+        crosslink_level="medium",
+    )
+    r_high = engine.suggest_recipe(req_high)
+    r_bio = engine.suggest_recipe(req_bio)
+    print(f"Test 2: PI high_res={r_high.pi_percent:.3f}, biocompatible={r_bio.pi_percent:.3f}")
+
+    # Test 3: Stiffness increases with PEGDA wt%
+    base_G = db.predict_stiffness(pegda_mw=2000, pegda_wt=10.0, dna_ratio=0.1)
+    high_G = db.predict_stiffness(pegda_mw=2000, pegda_wt=20.0, dna_ratio=0.1)
+    assert high_G > base_G
+    print(f"Test 3: base G={base_G:.2f} kPa, high G={high_G:.2f} kPa")
+
+    print("\nSelf-tests completed.\n")
+
+
+
+# Text-based interactive menu (no need for CLI flags)
+
+def interactive_menu(engine: RecipeEngine, vis: Visualizer) -> None:
+    """
+    simple text menu so you can try things without typing command-line options.
+
+    just type a number (1–7) to choose what to do.
+    """
+    while True:
+        print("\n--- DNA Hydrogel Design Assistant Menu ---")
+        print("1. Suggest a hydrogel recipe")
+        print("2. Plot stiffness curve")
+        print("3. Plot diffusion vs PEGDA wt%")
+        print("4. Plot DNA crosslink effect")
+        print("5. Run self-tests")
+        print("6. Launch GUI")
+        print("7. Exit")
+
+        choice = input("Select an option (1–7): ").strip()
+
+        if choice == "1":
+            try:
+                stiffness = float(input("Target stiffness (kPa, e.g. 5): ").strip())
+            except ValueError:
+                print("Invalid stiffness. Please enter a number.")
+                continue
+
+            pattern = input("Pattern priority [high_res / balanced / biocompatible] (default balanced): ").strip()
+            if pattern == "":
+                pattern = "balanced"
+
+            cross = input("Crosslink level [low / medium / high] (default medium): ").strip()
+            if cross == "":
+                cross = "medium"
+
+            req = RecipeRequest(
+                target_stiffness_kpa=stiffness,
+                pattern_priority=pattern,
+                crosslink_level=cross,
+            )
+            recipe = engine.suggest_recipe(req)
+            print("\nSuggested Recipe:")
+            print(json.dumps(recipe.to_dict(), indent=2))
+
+        elif choice == "2":
+            try:
+                mw = int(input("PEGDA MW (e.g. 700, 2000, 3400, 10000): ").strip())
+                dna = float(input("DNA ratio (0–0.2, e.g. 0.1): ").strip())
+            except ValueError:
+                print("Invalid MW or DNA ratio.")
+                continue
+            vis.plot_stiffness_curve(pegda_mw=mw, dna_ratio=dna)
+
+        elif choice == "3":
+            vis.plot_diffusion_vs_wt()
+
+        elif choice == "4":
+            try:
+                mw = int(input("PEGDA MW (e.g. 700, 2000, 3400, 10000): ").strip())
+                wt = float(input("PEGDA wt% (e.g. 10): ").strip())
+            except ValueError:
+                print("Invalid MW or wt%.")
+                continue
+            vis.plot_dna_factor_curve(pegda_mw=mw, pegda_wt=wt)
+
+        elif choice == "5":
+            run_selftests()
+
+        elif choice == "6":
+            if tk is None:
+                print("Tkinter is not available in this environment.")
+            else:
+                root = tk.Tk()
+                gui = HydrogelGUI(root, engine=engine)  # noqa: F841
+                root.mainloop()
+
+        elif choice == "7":
+            print("Exiting menu.")
+            break
+
+        else:
+            print("Invalid choice. Try again.")
+
+
+# Main entry point for running from the command line
+
+def main() -> None:
+    """
+    Main function that:
+      - parses command-line arguments,
+      - sets up the config and database,
+      - figures out which mode to run,
+      - and then calls the right function.
+    """
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    # if the user wants to write a template config file and exit.
+    if args.write_config is not None:
+        cfg = GlobalConfig()
+        path = Path(args.write_config)
+        ConfigManager.save_config(cfg, path)
+        return
+
+    # either load a config from file or use the default one.
+    if args.config is not None:
+        cfg_path = Path(args.config)
+        if not cfg_path.exists():
+            raise SystemExit(f"Config file not found: {cfg_path}")
+        cfg = ConfigManager.load_config(cfg_path)
+    else:
+        cfg = GlobalConfig()
+
+    db = HydrogelDatabase()
+    engine = RecipeEngine(db=db, config=cfg)
+    vis = Visualizer(db=db)
+
+    # if no mode was given, ask the user at runtime.
+    mode = args.mode
+    if mode is None:
+        print("No mode specified. Choose how you want to run the program:")
+        print("1. Interactive menu")
+        print("2. Default recipe suggestion")
+        print("3. GUI (graphical interface)")
+        choice = input("Enter 1, 2, or 3 (default 1): ").strip()
+        if choice == "2":
+            mode = "suggest"
+        elif choice == "3":
+            mode = "gui"
+        else:
+            mode = "menu"
+
+    if mode == "selftest":
+        run_selftests()
+        return
+
+    if mode == "gui":
+        if tk is None:
+            raise SystemExit("Tkinter is not available in this environment.")
+        root = tk.Tk()
+        gui = HydrogelGUI(root, engine=engine)  # noqa: F841
+        root.mainloop()
+        return
+
+    if mode == "menu":
+        interactive_menu(engine, vis)
+        return
+
+    # make sure the output directory is ready for plots JSON.
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    show = not args.no_show
+
+    if mode == "suggest":
+        request = RecipeRequest(
+            target_stiffness_kpa=args.target_stiffness,
+            pattern_priority=args.pattern_priority,
+            crosslink_level=args.crosslink_level,
+            pegda_mw_preference=args.pegda_mw_pref,
+            max_pi_percent=args.max_pi,
+        )
+        recipe = engine.suggest_recipe(request)
+
+        # print in a somewhat nice way to the terminal.
+        print("\nDNA Hydrogel Recipe Suggestion")
+        print("--------------------------------")
+        print(f"Target stiffness:      {recipe.target_stiffness_kpa:.2f} kPa")
+        print(f"Predicted stiffness:   {recipe.predicted_stiffness_kpa:.2f} kPa")
+        print(f"PEGDA MW:              {recipe.pegda_mw} g/mol")
+        print(f"PEGDA wt%:             {recipe.pegda_wt_percent:.2f}")
+        print(f"DNA ratio:             {recipe.dna_ratio:.2f}")
+        print(f"DNA linker conc.:      {recipe.dna_linker_uM:.1f} µM")
+        print(f"Photoinitiator:        {recipe.pi_percent:.3f} wt% ({cfg.default_pi_type})")
+        print(f"Buffer:                {recipe.buffer}")
+        print("")
+        print(f"Predicted mesh size:   {recipe.predicted_mesh_nm:.1f} nm")
+        print(f"Predicted D:           {recipe.predicted_diffusion_um2_s:.1f} µm²/s")
+        print(f"Predicted resolution:  {recipe.predicted_resolution_um:.1f} µm")
+        print("")
+        print("Notes:")
+        print(recipe.notes)
+        print("")
+
+        # Also save the recipe to a JSON file.
+        recipe_path = output_dir / "recipe_suggestion.json"
+        with recipe_path.open("w", encoding="utf-8") as f:
+            json.dump(recipe.to_dict(), f, indent=2)
+        print(f"Recipe saved to {recipe_path}")
+
+    elif mode == "stiff":
+        savepath = output_dir / f"stiffness_mw{args.pegda_mw}_dna{args.dna_ratio:.2f}.png"
+        vis.plot_stiffness_curve(
+            pegda_mw=args.pegda_mw,
+            dna_ratio=args.dna_ratio,
+            show=show,
+            savepath=savepath,
+        )
+        print(f"Stiffness curve saved to {savepath}")
+
+    elif mode == "diff":
+        savepath = output_dir / "diffusion_vs_wt.png"
+        vis.plot_diffusion_vs_wt(show=show, savepath=savepath)
+        print(f"Diffusion plot saved to {savepath}")
+
+    elif mode == "dna":
+        savepath = output_dir / f"dna_factor_mw{args.pegda_mw}_wt{args.pegda_wt:.1f}.png"
+        vis.plot_dna_factor_curve(
+            pegda_mw=args.pegda_mw,
+            pegda_wt=args.pegda_wt,
+            show=show,
+            savepath=savepath,
+        )
+        print(f"DNA factor plot saved to {savepath}")
+
+    else:
+        # If we somehow got here with an unknown mode, just bail out.
+        raise SystemExit(f"Unknown mode: {mode}")
+
+
+if __name__ == "__main__":
+    main()
